@@ -49,6 +49,7 @@
 
 #define ET 1e-10
 
+
 CPL_CVSID("$Id$")
 
 static GDALDatasetH
@@ -56,6 +57,11 @@ GDALWarpCreateOutput( GDALDatasetH hSrcDS, const char *pszFilename,
                       const char *pszFormat, const char *pszSourceSRS,
                       const char *pszTargetSRS, int nOrder,
                       char **papszCreateOptions );
+
+bool
+SuggestedWarpOutput( GDALDatasetH hSrcDS, const char* pszSourceSRS, const char* pszTargetSRS,
+                     double *adfDstGeoTransform, int *nPixels, int *nLines );
+void loadSourceDS();
 
 static double          dfMinX=0.0, dfMinY=0.0, dfMaxX=0.0, dfMaxY=0.0;
 static double          dfXRes=0.0, dfYRes=0.0;
@@ -69,10 +75,10 @@ static void Usage()
 
 {
     printf(
-        "Usage: gdalwarpsimple [--version] [--formats]\n"
+        "Usage: warp [--version] [--formats]\n"
         "    [-s_srs srs_def] [-t_srs srs_def] [-order n] [-et err_threshold]\n"
         "    [-te xmin ymin xmax ymax] [-tr xres yres] [-ts width height]\n"
-        "    [-of format] [-co \"NAME=VALUE\"]* srcfile dstfile\n" );
+        "    [-of format] [-co \"NAME=VALUE\"]* [-gpu] srcfile dstfile\n" );
     exit( 1 );
 }
 
@@ -111,7 +117,7 @@ char *SanitizeSRS( const char *pszUserInput )
 int main( int argc, char ** argv )
 
 {
-    GDALDatasetH        hSrcDS, hDstDS;
+    GDALDatasetH       hSrcDS, hDstDS;
     const char         *pszFormat = "GTiff";
     char               *pszTargetSRS = NULL;
     char               *pszSourceSRS = NULL;
@@ -122,6 +128,8 @@ int main( int argc, char ** argv )
     double             dfErrorThreshold = 0.125;
     GDALTransformerFunc pfnTransformer = NULL;
     char                **papszCreateOptions = NULL;
+	bool				useGPU = false;
+	ResampleMode		mode = MODE_NEAREST;
 
     GDALAllRegister();
 
@@ -199,8 +207,17 @@ int main( int argc, char ** argv )
         }
         else if (EQUAL(argv[i],"-r") && i < argc-1)
         {
-            
+            if ( EQUAL(argv[++i], "near") )
+                mode = MODE_NEAREST;
+            else if ( EQUAL(argv[i], "bilinear") )
+                mode = MODE_BILINEAR;
+            else if ( EQUAL(argv[i], "cubic") )
+                mode = MODE_BICUBIC;
         }
+		else if (EQUAL(argv[i],"-gpu"))
+		{
+			useGPU = true;
+		}
         else if( argv[i][0] == '-' )
             Usage();
         else if( pszSrcFilename == NULL )
@@ -221,13 +238,15 @@ int main( int argc, char ** argv )
 
     hSrcDS = GDALOpen( pszSrcFilename, GA_ReadOnly );
 
-    if( hSrcDS == NULL )
+    if( hSrcDS == NULL ) {
+        fprintf(stderr, "Input file %s can't be opened.\n", pszSrcFilename);
         exit( 2 );
+    }
 
 /* -------------------------------------------------------------------- */
 /*      Check that there's at least one raster band                     */
 /* -------------------------------------------------------------------- */
-    if ( GDALGetRasterCount(hSrcDS) == 0 )
+    if ( GDALGetRasterCount( hSrcDS ) == 0 )
     {
         fprintf(stderr, "Input file %s has no raster bands.\n", pszSrcFilename );
         exit( 2 );
@@ -237,10 +256,10 @@ int main( int argc, char ** argv )
     {
         if( GDALGetProjectionRef( hSrcDS ) != NULL
             && strlen(GDALGetProjectionRef( hSrcDS )) > 0 )
-            pszSourceSRS = CPLStrdup(GDALGetProjectionRef( hSrcDS ));
+            pszSourceSRS = CPLStrdup(GDALGetProjectionRef(hSrcDS));
 
         else if( GDALGetGCPProjection( hSrcDS ) != NULL
-                 && strlen(GDALGetGCPProjection(hSrcDS)) > 0
+                 && strlen(GDALGetGCPProjection( hSrcDS )) > 0
                  && GDALGetGCPCount( hSrcDS ) > 1 )
             pszSourceSRS = CPLStrdup(GDALGetGCPProjection( hSrcDS ));
         else
@@ -251,8 +270,8 @@ int main( int argc, char ** argv )
         pszTargetSRS = CPLStrdup(pszSourceSRS);
     
     // print source/destination srs
-    printf("Source SRS: %s\n", pszSourceSRS);
-    printf("Destination SRS: %s\n", pszTargetSRS);
+    //printf("Source SRS: %s\n", pszSourceSRS);
+    //printf("Target SRS: %s\n", pszTargetSRS);
 
        
     
@@ -264,107 +283,34 @@ int main( int argc, char ** argv )
     const int nSrcXSize = GDALGetRasterXSize(hSrcDS);
     const int nSrcYSize = GDALGetRasterYSize(hSrcDS);
     const int nBandCount = GDALGetRasterCount( hSrcDS );
-    GByte **papabySrcData = static_cast<GByte **>(
-        CPLCalloc(nBandCount, sizeof(GByte*)) );
-
-    bool ok = true;
-    for( int iBand = 0; iBand < nBandCount; iBand++ )
+    uchar **papabySrcData = (uchar **)malloc(nBandCount * sizeof(uchar *));
+    if (papabySrcData == NULL) {
+        fprintf(stderr, "warp out of memory.\n");
+        exit(1);
+    }
+    for (int iBand = 0; iBand < nBandCount; ++iBand)
     {
-        papabySrcData[iBand] = static_cast<GByte *>(
-            VSI_MALLOC2_VERBOSE(nSrcXSize, nSrcYSize) );
-        if( papabySrcData[iBand] == nullptr )
+        papabySrcData[iBand] = (uchar*)malloc(nSrcXSize * nSrcYSize * sizeof(uchar));
+        if (papabySrcData[iBand] == NULL)
         {
-            CPLError( CE_Failure, CPLE_OutOfMemory,
-                      "GDALSimpleImageWarp out of memory." );
-            ok = false;
-            break;
+            fprintf(stderr, "warp out of memeory.\n");
+            exit(1);
         }
-
-        if( GDALRasterIO(
-                GDALGetRasterBand(hSrcDS,iBand+1), GF_Read,
+        if (CE_None != GDALRasterIO(
+                GDALGetRasterBand(hSrcDS, iBand+1), GF_Read,
                 0, 0, nSrcXSize, nSrcYSize,
                 papabySrcData[iBand], nSrcXSize, nSrcYSize, GDT_Byte,
-                0, 0 ) != CE_None )
+                0, 0 )) 
         {
             CPLError( CE_Failure, CPLE_FileIO,
-                      "GDALSimpleImageWarp GDALRasterIO failure %s",
+                      "warp GDALRasterIO failure %s",
                       CPLGetLastErrorMsg() );
-            ok = false;
-            break;
+            exit(2);
         }
     }
-    if( !ok )
-    {
-        for( int i=0; i < nBandCount; i++ )
-        {
-            VSIFree(papabySrcData[i]);
-        }
-        CPLFree(papabySrcData);
-        return FALSE;
-    }
-
-    double sourceGeotransform[6];
-    if (CE_None != GDALGetGeoTransform(hSrcDS, sourceGeotransform)) {
-        printf("Error: can't get Source GeoTransform\n");
-        exit(-1);
-    }
-    printf("Top Left: (%lf, %lf)\n", 
-            sourceGeotransform[0], sourceGeotransform[3]);
     
-    printf("Pixel Size: (%lf, %lf)\n", 
-            sourceGeotransform[1], sourceGeotransform[5]);
 
 
-
-
-
-
-    // GPU
-	/*
-    double2 *d_Output;
-    double2 *h_Output;
-    h_Output = (double2 *)malloc(nSrcXSize * nSrcYSize * sizeof(double2));
-    checkCudaErrors(cudaMalloc((void **)&d_Output, nSrcXSize * nSrcYSize * sizeof(double2)));
-    double3 geoTransformx, geoTransformy;
-    geoTransformx.x = padfTransform[0];
-    geoTransformx.y = padfTransform[1];
-    geoTransformx.z = padfTransform[2];
-    geoTransformy.x = padfTransform[3];
-    geoTransformy.y = padfTransform[4];
-    geoTransformy.z = padfTransform[5];
-    dim3 blockSize(32, 32);
-    dim3 gridSize((nSrcXSize + 31) / 32, (nSrcYSize + 31) / 32);
-
-    setGeoTransform(padfTransform);
-
-    transformCuda(d_Output, nSrcXSize, nSrcYSize, blockSize, gridSize, geoTransformx, geoTransformy);
-
-    checkCudaErrors(cudaMemcpy(h_Output, d_Output, nSrcXSize * nSrcYSize * sizeof(double2), cudaMemcpyDeviceToHost));
-    */
-    // diff
-	/*
-    bool flag = false;
-    for (int i = 0; i < nSrcXSize; ++i) {
-        for (int j = 0; j < nSrcYSize; ++j) {
-            int pos = i + j * nSrcXSize;
-            if (abs(crs_x[pos] - h_Output[pos].x) > ET || abs(crs_y[pos] - h_Output[pos].y) > ET) {
-                printf("Error: to big\n");
-                flag = true;
-                break;
-            }
-        }
-        if (flag) {
-            break;
-        }
-    }
-	*/
-    //clean up
-	/*
-    free(crs_x);
-    free(crs_y);
-    free(h_Output);
-    checkCudaErrors(cudaFree(d_Output));
-	*/
 /* -------------------------------------------------------------------- */
 /*      Does the output dataset already exist?                          */
 /* -------------------------------------------------------------------- */
@@ -399,6 +345,9 @@ int main( int argc, char ** argv )
 
     if( hDstDS == NULL )
         exit( 1 );
+
+
+
 
 /* -------------------------------------------------------------------- */
 /*      Create a transformation object from the source to               */
@@ -455,139 +404,259 @@ int main( int argc, char ** argv )
     OGRSpatialReference poSourceSRS(pszSourceSRS);
     OGRSpatialReference poTargetSRS(pszTargetSRS);
 
-    double targetSemiMajor = poTargetSRS.GetSemiMajor();
-    double targetSemiMinor = poTargetSRS.GetSemiMinor();
-    double targetSquaredEccentricity = poTargetSRS.GetSquaredEccentricity();
+    const char *sourceCode  = poSourceSRS.GetAuthorityCode("GEOGCS");
+    const char *targetCode  = poTargetSRS.GetAuthorityCode("GEOGCS");
+    //printf("source code: %s\n", sourceCode);
+    //printf("target code: %s\n", targetCode);
+
+	double srcDatum[4], dstDatum[4];
+    double targetSemiMajor = dstDatum[0] = poTargetSRS.GetSemiMajor();
+    double targetSemiMinor = dstDatum[1] =  poTargetSRS.GetSemiMinor();
+    double targetSquaredEccentricity = dstDatum[2] = poTargetSRS.GetSquaredEccentricity();
     double targetInvFlattening = poTargetSRS.GetInvFlattening();
-    double targetEpsilon = getEpsilon(targetSquaredEccentricity);
+    double targetEpsilon = dstDatum[3] = getEpsilon(targetSquaredEccentricity);
     double targetOffset = poTargetSRS.GetPrimeMeridian();
     double targetAngularUnits = poTargetSRS.GetAngularUnits();
-    double coef[7];
-    double sourceSemiMajor = poSourceSRS.GetSemiMajor();
-    double sourceSemiMinor = poSourceSRS.GetSemiMinor();
-    double sourceSquaredEccentricity = poSourceSRS.GetSquaredEccentricity();
+	double srcToWGS84[7] = { 0.0 }, dstToWGS84[7] = {0.0};
+    double sourceSemiMajor = srcDatum[0] = poSourceSRS.GetSemiMajor();
+    double sourceSemiMinor = srcDatum[1] = poSourceSRS.GetSemiMinor();
+    double sourceSquaredEccentricity = srcDatum[2] = poSourceSRS.GetSquaredEccentricity();
     double sourceInvFlattening = poSourceSRS.GetInvFlattening();
-    double sourceEpsilon = getEpsilon(sourceSquaredEccentricity);
+    double sourceEpsilon = srcDatum[3] = getEpsilon(sourceSquaredEccentricity);
     double sourceOffset = poSourceSRS.GetPrimeMeridian();
     double sourceAngularUnits = poSourceSRS.GetAngularUnits();
-    if (OGRERR_NONE != poTargetSRS.GetTOWGS84(coef)) {
-        printf("Target SRS TOWGS84 isn't available\n");
-        exit(-1);
+    if (OGRERR_NONE != poTargetSRS.GetTOWGS84(dstToWGS84) || OGRERR_NONE != poSourceSRS.GetTOWGS84(srcToWGS84)) {
+        printf("TOWGS84 isn't available\n");
+        //exit(-1);
     }
-    for (int i = 3; i <= 5; ++i) {
-        coef[i] *= targetAngularUnits / 60 /60;
-    }
-    coef[6] = 1 + coef[6] * 1e-6;
+    char *sourceProj4, *targetProj4;
+    poSourceSRS.exportToProj4(&sourceProj4);
+    poTargetSRS.exportToProj4(&targetProj4);
+    //printf("source proj4: %s\nsource proj4: %s\n", sourceProj4, targetProj4);
+    
     //printf("Semi Major = %lf\nSemi Minor = %lf\nInverse Flatenning = %lf\nsquaredEccentricity = %lf\n", 
     //        semiMajor, semiMinor, invFlattening, squaredEccentricity);
     //for (int i = 0; i < 7; ++i) {
     //    printf("%.10lf\n", coef[i]);
     //}
-    
+    for (int i = 3; i <= 5; ++i) {
+        srcToWGS84[i] *= M_PI / 180 / 60 /60;
+        dstToWGS84[i] *= M_PI / 180 / 60 /60;
+    }
+    srcToWGS84[6] = 1 + srcToWGS84[6] * 1e-6;
+    dstToWGS84[6] = 1 + dstToWGS84[6] * 1e-6;
+
+	/******************************************/
+	/*  		projection coordinate         */
+	/******************************************/
+	/*
     if (poSourceSRS.IsProjected()) {
         // source srs
         double scaleFactor = poTargetSRS.GetProjParm(SRS_PP_SCALE_FACTOR);
         printf("scale factor = %lf\n", scaleFactor);
     }
-    //printf("Source Anguilar Units = %lf\n", sourceAngularUnits);
-    //printf("Target Anguilar Units = %lf\n", targetAngularUnits);
 
     if (poTargetSRS.IsProjected()) {
         // target srs
         double scaleFactor = poTargetSRS.GetProjParm(SRS_PP_SCALE_FACTOR);
         printf("scale factor = %lf\n", scaleFactor);
     }
+	*/
 
     int nDstXSize = GDALGetRasterXSize(hDstDS);
     int nDstYSize = GDALGetRasterXSize(hDstDS);
 
-    double targetGeotransform[6];
-    if (CE_None != GDALGetGeoTransform(hDstDS, targetGeotransform)) {
-        printf("Error: can't get Target GeoTransform\n");
+    double targetGeotransform[6], sourceGeotransform[6];
+    if (CE_None != GDALGetGeoTransform(hDstDS, targetGeotransform) ||
+		GDALGetGeoTransform(hSrcDS, sourceGeotransform)) {
+        printf("Error: can't get GeoTransform\n");
         exit(-1);
     }
-    //printf("Target Origin: (%lf, %lf)\n", targetGeotransform[0], targetGeotransform[3]);
-    //printf("Target Pixel Size: (%lf, %lf)\n", targetGeotransform[1], targetGeotransform[5]);
 
-    int2 *output = new int2[nDstXSize * nDstYSize];
-    for (int ix = 0; ix < nDstXSize; ++ix) {
-        for (int iy = 0; iy < nDstYSize; ++iy) {
-            // pixel/line coordinate to geopgrahic coordinate
-            //printf("(%d, %d) -> ", ix, iy);
+	
+	if (!useGPU) {
+    	int2 *output = new int2[nDstXSize * nDstYSize];
+    	clock_t start = clock();
+    	for (int ix = 0; ix < nDstXSize; ++ix) {
+        	for (int iy = 0; iy < nDstYSize; ++iy) {
+            	// pixel/line coordinate to geopgrahic coordinate
+            	//printf("(%d, %d) -> ", ix, iy);
 
-            double3 coord = pl2Geographic(make_int2(ix, iy), targetGeotransform);
-            //printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
-            coord.x *= targetAngularUnits;
-            coord.y *= targetAngularUnits;
-            //printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
+            	double3 coord = pl2Geographic(make_int2(ix, iy), targetGeotransform);
+            	//printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
+            	coord.x *= targetAngularUnits;
+            	coord.y *= targetAngularUnits;
 
-            // grographic coordinate to grocentric coordinate
-            coord = geographic2Geocentric(coord, targetSemiMajor, targetSquaredEccentricity);
-            //printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
+            	// grographic coordinate to grocentric coordinate
+            	coord = geographic2Geocentric(coord, targetSemiMajor, targetSquaredEccentricity);
+            	//printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
 
-            // WGS72 To WGS84
-            coord = geocentric2Geocentric(coord, coef);
-            //printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
+            	// geocentric To WGS84
+          		coord = geocentric2WGS84(coord, dstToWGS84);
+            	//printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
 
-            //geocentric coordinate to geographic coordinate
-            coord = geocentric2Geographic(coord, sourceSemiMajor, sourceSemiMinor, 
+				// WGS84 to geocentric
+            	coord = WGS84ToGeocentric(coord, srcToWGS84);
+            	//printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
+
+
+            	//geocentric coordinate to geographic coordinate
+            	coord = geocentric2Geographic(coord, sourceSemiMajor, sourceSemiMinor, 
                                                     sourceSquaredEccentricity,sourceEpsilon);
-            //printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
-            coord.x /= sourceAngularUnits;
-            coord.y /= sourceAngularUnits;
-            //printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
+            	//printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
+            	coord.x /= sourceAngularUnits;
+            	coord.y /= sourceAngularUnits;
+           		//printf("(%lf, %lf, %lf) -> ", coord.x, coord.y, coord.z);
 
-            output[ix + iy * nDstXSize] = geographic2Pl(coord, sourceGeotransform, 
+            	output[ix + iy * nDstXSize] = geographic2Pl(coord, sourceGeotransform, 
                                 sourceGeotransform[1] * sourceGeotransform[5] - sourceGeotransform[2] * sourceGeotransform[4]);
-            if (output[ix + iy * nDstXSize].y >= nSrcXSize || output[ix + iy * nDstXSize].y >= nSrcYSize) {
-                printf("Error: out of bound\n");
-                exit(-1);
-            }
-        }
-    }
+           		if (output[ix + iy * nDstXSize].y >= nSrcXSize || output[ix + iy * nDstXSize].y >= nSrcYSize) {
+                	printf("Error: out of bound\n");
+                	exit(-1);
+            	}
+				/*
+				printf("(%d, %d)\n", output[ix + iy * nDstXSize].x, output[ix + iy * nDstXSize].y);
+				int flag = 0;
+				scanf("%d", &flag);
+				if (!flag) {
+					exit(1);
+				}
+				*/
+        	}
+    	}
+    	clock_t end = clock();
+    	printf("time = %lfms\n", (double)(end - start));
 
-    // IO
-    uchar *image = new uchar[nDstXSize * nDstYSize];
-    for (int iBand = 0; iBand < nBandCount; ++iBand) {
-        for (int ix = 0; ix < nDstXSize; ++ix) {
-            for (int iy = 0; iy < nDstYSize; ++iy) {
-                int pos = ix + iy * nDstXSize;
-                if (output[pos].x < nSrcXSize && output[pos].y < nSrcYSize) {
-                    image[ix + iy * nDstXSize] = papabySrcData[iBand][output[pos].x + output[pos].y * nSrcXSize];
-                } else {
-                    image[ix + iy * nDstXSize] = 0;
-                }
-            }
-        }
-        if( GDALRasterIO(
-                GDALGetRasterBand(hDstDS,iBand+1), GF_Write,
-                0, 0, nDstXSize, nDstYSize,
-                image, nSrcXSize, nSrcYSize, GDT_Byte,
-                0, 0 ) != CE_None )
-        {
-            CPLError( CE_Failure, CPLE_FileIO,
-                      "GDALSimpleImageWarp GDALRasterIO failure %s",
-                      CPLGetLastErrorMsg() );
-            ok = false;
-            break;
-        }
-    }
+    	// IO
+    	uchar *image = new uchar[nDstXSize * nDstYSize];
+    	for (int iBand = 0; iBand < nBandCount; ++iBand) {
+        	for (int ix = 0; ix < nDstXSize; ++ix) {
+            	for (int iy = 0; iy < nDstYSize; ++iy) {
+                	int pos = ix + iy * nDstXSize;
+                	if (output[pos].x < nSrcXSize && output[pos].y < nSrcYSize) {
+                    	image[ix + iy * nDstXSize] = papabySrcData[iBand][output[pos].x + output[pos].y * nSrcXSize];
+                	} else {
+                    	image[ix + iy * nDstXSize] = 0;
+                	}
+            	}
+        	}
+        	if( GDALRasterIO(
+            	    GDALGetRasterBand(hDstDS,iBand+1), GF_Write,
+                		0, 0, nDstXSize, nDstYSize,
+                		image, nSrcXSize, nSrcYSize, GDT_Byte,
+                		0, 0 ) != CE_None )
+        	{
+            	CPLError( CE_Failure, CPLE_FileIO,
+                	      "GDALSimpleImageWarp GDALRasterIO failure %s",
+                    	  CPLGetLastErrorMsg() );
+        	}
+    	}
+		// clean
+    	delete[] output;
+    	delete[] image;
+	}
+	else {
+    // GPU
+		initConstant(sourceGeotransform, srcToWGS84, srcDatum, 
+					 targetGeotransform, dstToWGS84, dstDatum);
 
-    delete[] output;
-    delete[] image;
+		/*
+		double *d_srcGeoTransform, *d_srcToWGS84, *d_srcDatum,
+				*d_dstGeoTransform, *d_dstToWGS84, *d_dstDatum;
+
+		checkCudaErrors(cudaMalloc((void**)&d_srcGeoTransform, 6 * sizeof(double)));
+		checkCudaErrors(cudaMemcpy(d_srcGeoTransform, sourceGeotransform, 6 * sizeof(double), cudaMemcpyHostToDevice));
+		checkCudaErrors(cudaMalloc((void**)&d_srcToWGS84, 7 * sizeof(double)));
+		checkCudaErrors(cudaMemcpy(d_srcToWGS84, srcToWGS84, 7 * sizeof(double), cudaMemcpyHostToDevice));
+		checkCudaErrors(cudaMalloc((void**)&d_srcDatum, 4 * sizeof(double)));
+    	checkCudaErrors(cudaMemcpy(d_srcDatum, srcDatum, 4 * sizeof(double), cudaMemcpyHostToDevice));
+    	checkCudaErrors(cudaMalloc((void**)&d_dstGeoTransform, 6 * sizeof(double)));
+     	checkCudaErrors(cudaMemcpy(d_dstGeoTransform, targetGeotransform, 6 * sizeof(double), cudaMemcpyHostToDevice));
+     	checkCudaErrors(cudaMalloc((void**)&d_dstToWGS84, 7 * sizeof(double)));
+     	checkCudaErrors(cudaMemcpy(d_dstToWGS84, dstToWGS84, 7 * sizeof(double), cudaMemcpyHostToDevice));
+     	checkCudaErrors(cudaMalloc((void**)&d_dstDatum, 4 * sizeof(double)));
+     	checkCudaErrors(cudaMemcpy(d_dstDatum, dstDatum, 4 * sizeof(double), cudaMemcpyHostToDevice));
+		*/
+
+   		int2 *d_coord;
+    	checkCudaErrors(cudaMalloc((void **)&d_coord, nDstXSize * nDstYSize * sizeof(int2)));
+   		//double3 *d_coord;
+    	//checkCudaErrors(cudaMalloc((void **)&d_coord, nDstXSize * nDstYSize * sizeof(double3)));
+    
+    	dim3 blockSize(32, 32);
+    	dim3 gridSize((nDstXSize + 31) / 32, (nDstYSize + 31) / 32);
+
+		// tansform coordinate
+    	transformGPUTest(nDstXSize, nDstYSize, d_coord, blockSize, gridSize);
+    
+
+		/*
+		checkCudaErrors(cudaFree(d_srcGeoTransform));
+		checkCudaErrors(cudaFree(d_srcToWGS84));
+		checkCudaErrors(cudaFree(d_srcDatum));
+		checkCudaErrors(cudaFree(d_dstGeoTransform));
+		checkCudaErrors(cudaFree(d_dstToWGS84));
+		checkCudaErrors(cudaFree(d_dstDatum));
+		*/
+
+
+		int2 *h_coord = (int2*)malloc(nDstXSize * nDstYSize * sizeof(int2));
+		checkCudaErrors(cudaMemcpy(h_coord, d_coord, nDstXSize * nDstYSize * sizeof(int2), cudaMemcpyDeviceToHost));
+		//double3 *h_coord = (double3*)malloc(nDstXSize * nDstYSize * sizeof(double3));
+		//checkCudaErrors(cudaMemcpy(h_coord, d_coord, nDstXSize * nDstYSize * sizeof(double3), cudaMemcpyDeviceToHost));
+
+		/*
+		for (int i = 0; i < 5; ++i)
+		{
+			for (int j = 0; j < 5; ++j)
+			{
+				printf("(%d, %d)\n", h_coord[i + j * nDstXSize].x, h_coord[i + j * nDstXSize].y);
+				//printf("(%lf, %lf)\n", h_coord[i + j * nDstXSize].x, h_coord[i + j * nDstXSize].y);
+			}
+		}
+		*/
+    	uchar *h_channel = (uchar*)malloc(nDstXSize * nDstYSize * sizeof(uchar));
+		if (h_channel == NULL)
+		{
+			printf("out of memory.\n");
+		}
+		uchar *d_channel;
+		checkCudaErrors(cudaMalloc((void**)&d_channel, nDstXSize * nDstYSize * sizeof(uchar)));
+		// resample
+		for (int iBand = 0; iBand < nBandCount; ++iBand)
+		{
+			initTexture(nSrcXSize, nSrcYSize, papabySrcData[iBand]);
+			render(nDstXSize, nDstYSize, 0.0, 0.0, 1.0, 0.0, 0.0, blockSize, gridSize, mode, d_channel, d_coord);
+			checkCudaErrors(cudaMemcpy(h_channel, d_channel, nDstXSize * nDstYSize * sizeof(uchar), cudaMemcpyDeviceToHost));
+        	if( GDALRasterIO(
+            	    GDALGetRasterBand(hDstDS,iBand+1), GF_Write,
+                	0, 0, nDstXSize, nDstYSize,
+                	h_channel, nDstXSize, nDstYSize, GDT_Byte,
+                	0, 0 ) != CE_None )
+        	{
+            	CPLError( CE_Failure, CPLE_FileIO,
+                	      "GDALSimpleImageWarp GDALRasterIO failure %s",
+                    	  CPLGetLastErrorMsg() );
+        	}
+			unbindTexture();
+		}
+    
+    	//clean up
+    	free(h_channel);
+    	checkCudaErrors(cudaFree(d_channel));
+		freeTexture();
+    	checkCudaErrors(cudaFree(d_coord));
+	}
     
 
 /* -------------------------------------------------------------------- */
 /*      Cleanup.                                                        */
 /* -------------------------------------------------------------------- */
 
-    GDALClose( hDstDS );
-    GDALClose( hSrcDS );
-    for( int i=0; i < nBandCount; i++ )
-    {
-        VSIFree(papabySrcData[i]);
-    }
-    CPLFree(papabySrcData);
+    GDALClose( (GDALDatasetH)hDstDS );
+    GDALClose( (GDALDatasetH)hSrcDS );
+    
+    free(papabySrcData);
     GDALDumpOpenDatasets( stderr );
 
     GDALDestroyDriverManager();
@@ -752,4 +821,200 @@ GDALWarpCreateOutput( GDALDatasetH hSrcDS, const char *pszFilename,
         GDALSetRasterColorTable( GDALGetRasterBand(hDstDS,1), hCT );
 
     return hDstDS;
+}
+
+
+
+// ours
+static GDALDatasetH
+CreateOutput( GDALDatasetH hSrcDS, const char *pszFilename,
+                      const char *pszFormat, const char *pszSourceSRS,
+                      const char *pszTargetSRS, int nOrder,
+                      char **papszCreateOptions )
+
+{
+    GDALDriverH hDriver;
+    GDALDatasetH hDstDS;
+    double adfDstGeoTransform[6];
+    int nPixels=0, nLines=0;
+    GDALColorTableH hCT;
+
+/* -------------------------------------------------------------------- */
+/*      Find the output driver.                                         */
+/* -------------------------------------------------------------------- */
+    hDriver = GDALGetDriverByName( pszFormat );
+    if( hDriver == NULL
+        || GDALGetMetadataItem( hDriver, GDAL_DCAP_CREATE, NULL ) == NULL )
+    {
+        int iDr;
+
+        printf( "Output driver `%s' not recognised or does not support\n",
+                pszFormat );
+        printf( "direct output file creation.  The following format drivers are configured\n"
+                "and support direct output:\n" );
+
+        for( iDr = 0; iDr < GDALGetDriverCount(); iDr++ )
+        {
+            GDALDriverH hDriver = GDALGetDriver(iDr);
+
+            if( GDALGetMetadataItem( hDriver, GDAL_DCAP_CREATE, NULL) != NULL )
+            {
+                printf( "  %s: %s\n",
+                        GDALGetDriverShortName( hDriver  ),
+                        GDALGetDriverLongName( hDriver ) );
+            }
+        }
+        printf( "\n" );
+        exit( 1 );
+    }
+
+
+/* -------------------------------------------------------------------- */
+/*      Get output definition.                              */
+/* -------------------------------------------------------------------- */
+    if( !SuggestedWarpOutput( hSrcDS, pszSourceSRS, pszTargetSRS, 
+                            adfDstGeoTransform, &nPixels, &nLines ))
+        return NULL;
+
+/* -------------------------------------------------------------------- */
+/*      Did the user override some parameters?                          */
+/* -------------------------------------------------------------------- */
+    if( dfXRes != 0.0 && dfYRes != 0.0 )
+    {
+        CPLAssert( nPixels == 0 && nLines == 0 );
+        if( dfMinX == 0.0 && dfMinY == 0.0 && dfMaxX == 0.0 && dfMaxY == 0.0 )
+        {
+            dfMinX = adfDstGeoTransform[0];
+            dfMaxX = adfDstGeoTransform[0] + adfDstGeoTransform[1] * nPixels;
+            dfMaxY = adfDstGeoTransform[3];
+            dfMinY = adfDstGeoTransform[3] + adfDstGeoTransform[5] * nLines;
+        }
+
+        nPixels = (int) ((dfMaxX - dfMinX + (dfXRes/2.0)) / dfXRes);
+        nLines = (int) ((dfMaxY - dfMinY + (dfYRes/2.0)) / dfYRes);
+        adfDstGeoTransform[0] = dfMinX;
+        adfDstGeoTransform[3] = dfMaxY;
+        adfDstGeoTransform[1] = dfXRes;
+        adfDstGeoTransform[5] = -dfYRes;
+    }
+
+    else if( nForcePixels != 0 && nForceLines != 0 )
+    {
+        if( dfMinX == 0.0 && dfMinY == 0.0 && dfMaxX == 0.0 && dfMaxY == 0.0 )
+        {
+            dfMinX = adfDstGeoTransform[0];
+            dfMaxX = adfDstGeoTransform[0] + adfDstGeoTransform[1] * nPixels;
+            dfMaxY = adfDstGeoTransform[3];
+            dfMinY = adfDstGeoTransform[3] + adfDstGeoTransform[5] * nLines;
+        }
+
+        dfXRes = (dfMaxX - dfMinX) / nForcePixels;
+        dfYRes = (dfMaxY - dfMinY) / nForceLines;
+
+        adfDstGeoTransform[0] = dfMinX;
+        adfDstGeoTransform[3] = dfMaxY;
+        adfDstGeoTransform[1] = dfXRes;
+        adfDstGeoTransform[5] = -dfYRes;
+
+        nPixels = nForcePixels;
+        nLines = nForceLines;
+    }
+
+    else if( dfMinX != 0.0 || dfMinY != 0.0 || dfMaxX != 0.0 || dfMaxY != 0.0 )
+    {
+        dfXRes = adfDstGeoTransform[1];
+        dfYRes = fabs(adfDstGeoTransform[5]);
+
+        nPixels = (int) ((dfMaxX - dfMinX + (dfXRes/2.0)) / dfXRes);
+        nLines = (int) ((dfMaxY - dfMinY + (dfYRes/2.0)) / dfYRes);
+
+        adfDstGeoTransform[0] = dfMinX;
+        adfDstGeoTransform[3] = dfMaxY;
+    }
+
+/* -------------------------------------------------------------------- */
+/*      Create the output file.                                         */
+/* -------------------------------------------------------------------- */
+
+    printf( "Creating output file is that %dP x %dL.\n", nPixels, nLines );
+
+    hDstDS = GDALCreate( hDriver, pszFilename, nPixels, nLines,
+                         GDALGetRasterCount(hSrcDS),
+                         GDALGetRasterDataType(GDALGetRasterBand(hSrcDS,1)),
+                         papszCreateOptions );
+
+    if( hDstDS == NULL )
+        return NULL;
+
+/* -------------------------------------------------------------------- */
+/*      Write out the projection definition.                            */
+/* -------------------------------------------------------------------- */
+    GDALSetProjection( hDstDS, pszTargetSRS );
+    GDALSetGeoTransform( hDstDS, adfDstGeoTransform );
+
+/* -------------------------------------------------------------------- */
+/*      Copy the color table, if required.                              */
+/* -------------------------------------------------------------------- */
+    hCT = GDALGetRasterColorTable( GDALGetRasterBand(hSrcDS,1) );
+    if( hCT != NULL )
+        GDALSetRasterColorTable( GDALGetRasterBand(hDstDS,1), hCT );
+
+    return hDstDS;
+}
+
+
+
+// ours
+bool
+SuggestedWarpOutput( GDALDatasetH hSrcDS, const char *pszSourceSRS, 
+                     const char* pszTargetSRS, double* adfOuttGeoTransform,
+                     int *pnPixels, int *pnLines) {
+    const int nInXSize = GDALGetRasterXSize(hSrcDS);
+    const int nInYSize = GDALGetRasterYSize(hSrcDS);
+
+    double sourceGeotransform[6];
+    if (CE_None != GDALGetGeoTransform(hSrcDS, sourceGeotransform)) {
+        printf("Error: can't get Source GeoTransform\n");
+        exit(-1);
+    }
+
+    const int nSteps = 20;
+    int nSamplePoints = 4 * (nSteps + 1);
+
+    double dfStep = 1.0 / nSteps;
+    
+    int2 *padCoord = (int2*)malloc(sizeof(int2) * nSamplePoints);
+
+    if (padCoord == nullptr) {
+        return false;
+    }
+
+    for (int iStep = 0; iStep <= nSteps; ++iStep) {
+        double dfRatio = (iStep == nSteps) ? 1.0 : iStep * dfStep;
+
+        // Along top
+        padCoord[iStep].x = dfRatio * nInXSize;
+        padCoord[iStep].y = 0.0;
+
+        // Along bottom
+        padCoord[nSteps + 1 + iStep].x = dfRatio * nInXSize;
+        padCoord[nSteps + 1 + iStep].y = nInYSize;
+
+        // Along left.
+        padCoord[2 * (nSteps + 1) + iStep].x = 0.0;
+        padCoord[2 * (nSteps + 1) + iStep].y = dfRatio * nInYSize;
+
+        // Along right.
+        padCoord[3 * (nSteps + 1) + iStep].x = nInXSize;
+        padCoord[3 * (nSteps + 1) + iStep].y = dfRatio * nInYSize;
+    }
+
+    
+    geoGraphic2GeoGraphicByWGS84(padCoord, nSamplePoints, pszSourceSRS, pszTargetSRS, sourceGeotransform);
+
+      
+
+    //TODO
+
+    return false;
 }

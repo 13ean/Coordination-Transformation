@@ -19,6 +19,14 @@ double getEpsilon(double squaredEccentricity) {
 }
 
 
+double second2Radian(double second) {
+    return second / 60 / 60 / 180 * M_PI;
+}
+
+double degree2Radian(double degree) {
+    return degree / 180 * M_PI;
+}
+
 double3 noneGreenwichGeographic2GreenwichGeographic(double3 coord) {
     double3 res;
     //TODO
@@ -26,7 +34,7 @@ double3 noneGreenwichGeographic2GreenwichGeographic(double3 coord) {
     return res;
 }
 
-double3 pl2Geographic(int2 plCoord, double *geotransform) {
+double3 pl2Geographic(int2 plCoord, const double *geotransform) {
     double3 res;
     res.x = geotransform[0] + plCoord.x * geotransform[1] + plCoord.y * geotransform[2];
     res.y = geotransform[3] + plCoord.x * geotransform[4] + plCoord.y * geotransform[5];
@@ -35,7 +43,7 @@ double3 pl2Geographic(int2 plCoord, double *geotransform) {
     return res;
 }
 
-int2 geographic2Pl(double3 coord, double *geotransform, double dTemp) {
+int2 geographic2Pl(double3 coord, const double *geotransform, const double dTemp) {
     int2 res;
 
     res.x = static_cast<int>((geotransform[5] * (coord.x - geotransform[0]) - 
@@ -46,7 +54,7 @@ int2 geographic2Pl(double3 coord, double *geotransform, double dTemp) {
     return res;
 }
 
-double3 geographic2Geocentric(double3 coord, double semiMajor, double squaredEccentricity) {
+double3 geographic2Geocentric(double3 coord, const double semiMajor, const double squaredEccentricity) {
     double verticalRadius = semiMajor / sqrt(1 - squaredEccentricity * pow(sin(coord.x), 2));
     
     double3 res;
@@ -56,8 +64,8 @@ double3 geographic2Geocentric(double3 coord, double semiMajor, double squaredEcc
     return res;
 }
 
-double3 geocentric2Geographic(double3 coord, double semiMajor, double semiMinor, 
-                                double squaredEccentricity, double epsilon) {
+double3 geocentric2Geographic(double3 coord, const double semiMajor, const double semiMinor, 
+                                const double squaredEccentricity, const double epsilon) {
     
     double p = sqrt(coord.x * coord.x + coord.y * coord.y);
     double q = atan2(coord.z * semiMajor, p * semiMinor);
@@ -70,8 +78,18 @@ double3 geocentric2Geographic(double3 coord, double semiMajor, double semiMinor,
     return res;
 }
 
-// 
-double3 geocentric2Geocentric(double3 coord, double* padfCoef, int nCoef) {
+// to be identified
+double3 WGS84ToGeocentric(double3 coord, const double* padfCoef, int nCoef) {
+    double3 res;
+    if (nCoef == 7) {
+        res.x = (coord.x + padfCoef[5] * coord.y - padfCoef[4] * coord.z) / padfCoef[6] - padfCoef[0];
+        res.y = (-coord.x * padfCoef[5] + coord.y + padfCoef[3] * coord.z) / padfCoef[6] - padfCoef[1];
+        res.z = (coord.x * padfCoef[4] - coord.y * padfCoef[3] + coord.z) / padfCoef[6] - padfCoef[2];
+    }
+    return res;
+}
+
+double3 geocentric2WGS84(double3 coord, const double* padfCoef, int nCoef) {
     double3 res;
     if (nCoef == 7) {
         res.x = padfCoef[6] * (coord.x - padfCoef[5] * coord.y + padfCoef[4] * coord.z) + padfCoef[0];
@@ -81,18 +99,54 @@ double3 geocentric2Geocentric(double3 coord, double* padfCoef, int nCoef) {
     return res;
 }
 
-void tansformCpu(double* output_x, double *output_y, int width, int height, double *padfTransform) {
-    time_t start = clock();
-    for (int i = 0; i < height; i++) {
-        for (int j = 0; j < width; ++j) {
-            int pos = i * width + j;
-            output_x[pos] = padfTransform[0] + j * padfTransform[1] + i * padfTransform[2];
-            output_y[pos] = padfTransform[3] + j * padfTransform[4] + i * padfTransform[5];
-        }
+
+
+// from source to target by WGS84
+void geoGraphic2GeoGraphicByWGS84(int2 *coord, int size,
+                                const char *pszSourceSRS, const char *pszTargetSRS,
+                                const double *padfSrcGeoTransform) {
+    OGRSpatialReference poSourceSRS(pszSourceSRS);
+    OGRSpatialReference poTargetSRS(pszTargetSRS);
+
+    double targetSemiMajor = poTargetSRS.GetSemiMajor();
+    double targetSemiMinor = poTargetSRS.GetSemiMinor();
+    double targetSquaredEccentricity = poTargetSRS.GetSquaredEccentricity();
+    double targetInvFlattening = poTargetSRS.GetInvFlattening();
+    double targetEpsilon = getEpsilon(targetSquaredEccentricity);
+    double targetOffset = poTargetSRS.GetPrimeMeridian();
+    double targetAngularUnits = poTargetSRS.GetAngularUnits();
+    double targetCoef[7] = {};
+    double sourceSemiMajor = poSourceSRS.GetSemiMajor();
+    double sourceSemiMinor = poSourceSRS.GetSemiMinor();
+    double sourceSquaredEccentricity = poSourceSRS.GetSquaredEccentricity();
+    double sourceInvFlattening = poSourceSRS.GetInvFlattening();
+    double sourceEpsilon = getEpsilon(sourceSquaredEccentricity);
+    double sourceOffset = poSourceSRS.GetPrimeMeridian();
+    double sourceAngularUnits = poSourceSRS.GetAngularUnits();
+    double sourceCoef[7] = {};
+    if (OGRERR_NONE != poTargetSRS.GetTOWGS84(targetCoef) || OGRERR_NONE != poTargetSRS.GetTOWGS84(sourceCoef)) {
+        printf("SRS TOWGS84 isn't available\n, Used as WGS84\n");
     }
-    time_t end = clock();
-    double timeCPU = static_cast<double>(end - start) / CLOCKS_PER_SEC * 1000;
-    printf("CPU Time: %lfms\n", timeCPU);
+    for (int i = 3; i <= 5; ++i) {
+        targetCoef[i] *= targetAngularUnits / 60 /60;
+        sourceCoef[i] *= sourceAngularUnits / 60 /60;
+    }
+    targetCoef[6] = 1 + targetCoef[6] * 1e-6;
+    sourceCoef[6] = 1 + sourceCoef[6] * 1e-6;
+
+    // convert 
+    double sourceSpan = padfSrcGeoTransform[1] * padfSrcGeoTransform[5] - padfSrcGeoTransform[2] * padfSrcGeoTransform[4];
+    
+    
+    for (int i = 0; i < size; ++i) {
+        double3 res = pl2Geographic(coord[i], padfSrcGeoTransform);
+        res = geographic2Geocentric(res, sourceSemiMajor, sourceSquaredEccentricity);
+        res = geocentric2WGS84(res, sourceCoef);
+        res = WGS84ToGeocentric(res, targetCoef);
+        res = geocentric2Geographic(res, targetSemiMajor, targetSemiMinor, targetSquaredEccentricity, targetEpsilon);
+        coord[i].x = res.x;
+        coord[i].y = res.y;
+    }
 }
 
 #ifdef __cplusplus

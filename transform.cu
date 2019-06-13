@@ -1,129 +1,146 @@
-#ifndef TRANSFORM_CU
-#define TRANSFORM_CU
-
-#include <stdlib.h>
-#include <stdio.h>
-#include <string.h>
-
-#include <helper_math.h>
-
-// includes, cuda
-#include <helper_cuda.h>
-
-typedef unsigned int uint;
-typedef unsigned char uchar;
-
-#include "transform_common.h"
+/**
+ * Copyright 1993-2015 NVIDIA Corporation.  All rights reserved.
+ *
+ * Please refer to the NVIDIA end user license agreement (EULA) associated
+ * with this source code for terms and conditions that govern your use of
+ * this software. Any use, reproduction, disclosure, or distribution of
+ * this software and related documentation outside the terms of the EULA
+ * is strictly prohibited.
+ *
+ */
 
 
+ #ifndef _BICUBICTEXTURE_CU_
+ #define _BICUBICTEXTURE_CU_
+ 
+ #include <stdlib.h>
+ #include <stdio.h>
+ #include <string.h>
+ 
+ #include <helper_math.h>
+ 
+ // includes, cuda
+ #include <helper_cuda.h>
+ 
+ 
+ #include "transform_kernel.cuh"
+ #include "transform_common.h"
+ 
+ cudaArray *d_imageArray = 0;
+ 
+ extern "C"
+ void initTexture(int imageWidth, int imageHeight, uchar *h_data)
+ {
+     // allocate array and copy image data
+     cudaChannelFormatDesc channelDesc = cudaCreateChannelDesc(8, 0, 0, 0, cudaChannelFormatKindUnsigned);
+     checkCudaErrors(cudaMallocArray(&d_imageArray, &channelDesc, imageWidth, imageHeight));
+     uint size = imageWidth * imageHeight * sizeof(uchar);
+     checkCudaErrors(cudaMemcpyToArray(d_imageArray, 0, 0, h_data, size, cudaMemcpyHostToDevice));
+     free(h_data);
+ 
+     // set texture parameters
+     tex.addressMode[0] = cudaAddressModeClamp;
+     tex.addressMode[1] = cudaAddressModeClamp;
+     tex.filterMode = cudaFilterModeLinear;
+     tex.normalized = false;    // access with integer texture coordinates
+ 
+     getLastCudaError("initTexture");
+ 
+     // Bind the array to the texture
+     checkCudaErrors(cudaBindTextureToArray(tex, d_imageArray));
+ 
+     // bind same array to 2nd texture reference with point sampling
+     tex2.addressMode[0] = cudaAddressModeClamp;
+     tex2.addressMode[1] = cudaAddressModeClamp;
+     tex2.filterMode = cudaFilterModePoint;
+     tex2.normalized = false;    // access with integer texture coordinates
+ 
+     checkCudaErrors(cudaBindTextureToArray(tex2, d_imageArray));
+ }
 
-__constant__ double c_geoTransform[6];
+ extern "C"
+ void unbindTexture()
+ {
+	checkCudaErrors(cudaUnbindTexture(tex));
+	checkCudaErrors(cudaUnbindTexture(tex2));
+ }
+ 
+ extern "C"
+ void freeTexture()
+ {
+     checkCudaErrors(cudaFreeArray(d_imageArray));
+ }
 
-#ifdef __cplusplus
-extern "C" {
-#endif // __cpluscplus
+ extern "C"
+ void initConstant(double *h_srcGeoTransform, double *h_srcToWGS84, double *h_srcDatum, 
+ 					double *h_dstGeoTransform, double *h_dstToWGS84, double *h_dstDatum)
+ {
+    cudaMemcpyToSymbol(c_srcGeoTransform, h_srcGeoTransform, 6 * sizeof(double));
+    cudaMemcpyToSymbol(c_srcToWGS84, h_srcToWGS84, 7 * sizeof(double));
+    cudaMemcpyToSymbol(c_srcDatum, h_srcDatum, 4 * sizeof(double));
+    cudaMemcpyToSymbol(c_dstGeoTransform, h_dstGeoTransform, 6 * sizeof(double));
+    cudaMemcpyToSymbol(c_dstToWGS84, h_dstToWGS84, 7 * sizeof(double));
+    cudaMemcpyToSymbol(c_dstDatum, h_dstDatum, 4 * sizeof(double));
+ }
+ 
 
-void setGeoTransform(double *h_geoTransform)
+// transform coordinate without projection using CUDA
+extern "C"
+void transformGPU(int width, int height, int2 *coord,
+                        dim3 blockSize, dim3 gridSize)
 {
-    cudaMemcpyToSymbol(c_geoTransform, h_geoTransform, 6 * sizeof(double));
-}
+    transformNoProjGPU<<<gridSize, blockSize>>>(coord, width, height);
 
-
-/*
-__device__ __host__ inline double getSquareOfEccentricity(double inverseFlatenning) {
-    return 2 * inverseFlatenning - inverseFlatenning * inverseFlatenning;
-}
-
-__device__ __host__ inline double getEpsilon(double squareOfEccentricity) {
-    return squareOfEccentricity / (1 - squareOfEccentricity);
-}
-
-__device__ __host__ inline double3 geocentirc2Geographic(double3 coord, double semiMajor, double inverseFlatenning) {
-    double squareOfEccentricity = getSquareOfEccentricity(inverseFlatenning);
-    double epsilon = getEpsilon(squareOfEccentricity);
-    //TODO
-    double3 res;
-    res.x = 
-}
-*/
-
-
-__device__ inline double2 PLCoord2ProjCoord(int2 plCoord) {
-    double2 res;    
-    res.x = c_geoTransform[0] + plCoord.x * c_geoTransform[1] + plCoord.y * c_geoTransform[2];
-    res.y = c_geoTransform[3] + plCoord.x * c_geoTransform[4] + plCoord.y * c_geoTransform[5];
-    return res;
-}
-
-// Transverse Mercator
-__device__ inline double2 projCoord2GeoCoord(double2 projCoord) {
-    double2 res;
-
-    return res;
-}
-
-__device__ inline double2 geoCoord2ProjCoord(double2 geoCoord) {
-    double2 res;
-
-
-
-    return res;
-}
-
-__device__ inline int2 projCoord2PLCoord(double2 projCoord) {
-    double dTemp = c_geoTransform[1] * c_geoTransform[5] - c_geoTransform[2] * c_geoTransform[4];
-    int2 res;
-    res.x = static_cast<int>((c_geoTransform[5] * (projCoord.x - c_geoTransform[0]) - 
-             c_geoTransform[2] * (projCoord.y - c_geoTransform[3])) / dTemp + 0.5);
-    res.y = static_cast<int>((c_geoTransform[4] * (projCoord.x - c_geoTransform[0]) - 
-             c_geoTransform[1] * (projCoord.y - c_geoTransform[3])) / dTemp + 0.5);
-
-    return res;
-}
-
-__global__ void computeTransform2(double2 *output, int width, int height, 
-    double3 geoTransformx, double3 geoTransformy) {
-    int ix = blockIdx.x * blockDim.x + threadIdx.x;
-    int iy = blockIdx.y * blockDim.y + threadIdx.y;
-    if (ix < width && iy < height) {
-        int pos = iy * width + ix;
-        output[pos].x = geoTransformx.x + ix * geoTransformx.y + iy * geoTransformx.z;
-        output[pos].y = geoTransformy.x + ix * geoTransformy.y + iy * geoTransformy.z;
-    }
-}
-
-void transformCuda(double2 *output, int width, int height, 
-    dim3 blockSize, dim3 gridSize, 
-    double3 geoTransformx, double3 geoTransformy) {
-
-    cudaDeviceSynchronize();
-
-    // Allocate CUDA events that we'll use for timing
-    cudaEvent_t startCUDA;
-    checkCudaErrors(cudaEventCreate(&startCUDA));
-
-    cudaEvent_t stopCUDA;
-    checkCudaErrors(cudaEventCreate(&stopCUDA));
-
-    // Record the start event
-    checkCudaErrors(cudaEventRecord(startCUDA, NULL));
-
-    computeTransform2<<<gridSize, blockSize>>>(output, width, height, geoTransformx, geoTransformy);
-
-    // Record the stop event
-    checkCudaErrors(cudaEventRecord(stopCUDA, NULL));
-
-    // Wait for the stop event to complete
-    checkCudaErrors(cudaEventSynchronize(stopCUDA));
-
-    float msecTotal = 0.0f;
-    checkCudaErrors(cudaEventElapsedTime(&msecTotal, startCUDA, stopCUDA));
-    printf("GPU Time: %lfms\n", msecTotal);
     getLastCudaError("kernel failed");
 }
 
-#ifdef __cplusplus
-}
-#endif // __cpluscplus
+extern "C"
+void transformGPUTest(int width, int height, int2 *coord,
+                        dim3 blockSize, dim3 gridSize)
+{
+    transformTest<<<gridSize, blockSize>>>(coord, width, height);
 
-#endif // TRANSFORM_CU
+    getLastCudaError("kernel failed");
+}
+
+ 
+ // render image using CUDA
+ extern "C"
+ void render(int width, int height, float tx, float ty, float scale, float cx, float cy,
+             dim3 blockSize, dim3 gridSize, int filter_mode, uchar *output, int2 *coord)
+ {
+     // call CUDA kernel, writing results to PBO memory
+     switch (filter_mode)
+     {
+         case MODE_NEAREST:
+             tex.filterMode = cudaFilterModePoint;
+             d_render<<<gridSize, blockSize>>>(output, coord, width, height, tx, ty, scale, cx, cy);
+             break;
+ 
+         case MODE_BILINEAR:
+             tex.filterMode = cudaFilterModeLinear;
+             d_render<<<gridSize, blockSize>>>(output, coord, width, height, tx, ty, scale, cx, cy);
+             break;
+ 
+         case MODE_BICUBIC:
+             tex.filterMode = cudaFilterModePoint;
+             d_renderBicubic<<<gridSize, blockSize>>>(output, coord, width, height, tx, ty, scale, cx, cy);
+             break;
+ 
+         case MODE_FAST_BICUBIC:
+             tex.filterMode = cudaFilterModeLinear;
+             d_renderFastBicubic<<<gridSize, blockSize>>>(output, coord, width, height, tx, ty, scale, cx, cy);
+             break;
+        
+        default:
+             tex.filterMode = cudaFilterModePoint;
+             d_render<<<gridSize, blockSize>>>(output, coord, width, height, tx, ty, scale, cx, cy);
+             break;
+
+     }
+ 
+     getLastCudaError("kernel failed");
+ }
+ 
+ #endif
+ 

@@ -33,8 +33,6 @@
 #
 ################################################################################
 
-# Location of the CUDA Toolkit
-CUDA_PATH ?= "/usr/local/cuda-10.0"
 
 ##############################
 # start deprecated interface #
@@ -148,10 +146,9 @@ else ifneq ($(TARGET_ARCH),$(HOST_ARCH))
     endif
 endif
 HOST_COMPILER ?= g++
-NVCC          := $(CUDA_PATH)/bin/nvcc -ccbin $(HOST_COMPILER)
+CC          := $(HOST_COMPILER)
 
 # internal flags
-NVCCFLAGS   := -m${TARGET_SIZE}
 CCFLAGS     :=
 LDFLAGS     :=
 
@@ -202,35 +199,15 @@ ifeq ($(TARGET_OS),qnx)
     LDFLAGS += -lsocket
 endif
 
-# Install directory of different arch
-CUDA_INSTALL_TARGET_DIR :=
-ifeq ($(TARGET_ARCH)-$(TARGET_OS),armv7l-linux)
-    CUDA_INSTALL_TARGET_DIR = targets/armv7-linux-gnueabihf/
-else ifeq ($(TARGET_ARCH)-$(TARGET_OS),aarch64-linux)
-    CUDA_INSTALL_TARGET_DIR = targets/aarch64-linux/
-else ifeq ($(TARGET_ARCH)-$(TARGET_OS),armv7l-android)
-    CUDA_INSTALL_TARGET_DIR = targets/armv7-linux-androideabi/
-else ifeq ($(TARGET_ARCH)-$(TARGET_OS),aarch64-android)
-    CUDA_INSTALL_TARGET_DIR = targets/aarch64-linux-androideabi/
-else ifeq ($(TARGET_ARCH)-$(TARGET_OS),armv7l-qnx)
-    CUDA_INSTALL_TARGET_DIR = targets/ARMv7-linux-QNX/
-else ifeq ($(TARGET_ARCH)-$(TARGET_OS),aarch64-qnx)
-    CUDA_INSTALL_TARGET_DIR = targets/aarch64-qnx/
-else ifeq ($(TARGET_ARCH),ppc64le)
-    CUDA_INSTALL_TARGET_DIR = targets/ppc64le-linux/
-endif
 
 # Debug build flags
 ifeq ($(dbg),1)
-      NVCCFLAGS += -g -G
       BUILD_TYPE := debug
 else
       BUILD_TYPE := release
 endif
 
 ALL_CCFLAGS :=
-ALL_CCFLAGS += $(NVCCFLAGS)
-ALL_CCFLAGS += $(EXTRA_NVCCFLAGS)
 ALL_CCFLAGS += $(addprefix -Xcompiler ,$(CCFLAGS))
 ALL_CCFLAGS += $(addprefix -Xcompiler ,$(EXTRA_CCFLAGS))
 
@@ -242,30 +219,11 @@ ALL_LDFLAGS += $(addprefix -Xlinker ,$(LDFLAGS))
 ALL_LDFLAGS += $(addprefix -Xlinker ,$(EXTRA_LDFLAGS))
 
 # Common includes and paths for CUDA and gdal
-INCLUDES  := -I./common/inc 
+INCLUDES  :=  
 LIBRARIES := -lgdal
 
 ################################################################################
 
-
-# Gencode arguments
-SMS ?= 30 35 37 50 52 60 61 70 75
-
-ifeq ($(SMS),)
-$(info >>> WARNING - no SM architectures have been specified - waiving sample <<<)
-SAMPLE_ENABLED := 0
-endif
-
-ifeq ($(GENCODE_FLAGS),)
-# Generate SASS code for each SM architecture listed in $(SMS)
-$(foreach sm,$(SMS),$(eval GENCODE_FLAGS += -gencode arch=compute_$(sm),code=sm_$(sm)))
-
-# Generate PTX code from the highest SM architecture in $(SMS) to guarantee forward-compatibility
-HIGHEST_SM := $(lastword $(sort $(SMS)))
-ifneq ($(HIGHEST_SM),)
-GENCODE_FLAGS += -gencode arch=compute_$(HIGHEST_SM),code=compute_$(HIGHEST_SM)
-endif
-endif
 
 ifeq ($(SAMPLE_ENABLED),0)
 EXEC ?= @echo "[@]"
@@ -276,7 +234,7 @@ endif
 # Target rules
 all: build
 
-build: test
+build: gdalsimplewarp
 
 check.deps:
 ifeq ($(SAMPLE_ENABLED),0)
@@ -285,29 +243,20 @@ else
 	@echo "Sample is ready - all dependencies have been met"
 endif
 
-transofrm_cpu.o: transform_gold.cpp
-	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+gdalsimplewarp.o: gdalwarpsimple.c
+	$(EXEC) $(CC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
-transform_cuda.o: transform.cu transform_kernel.cuh
-	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+gdalsimplewarp: gdalsimplewarp.o
+	$(EXEC) $(CC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
 
-main.o: main.cpp
-	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
+runrm:
+	$(EXEC) rm ./*.tif
 
-test: main.o transofrm_cpu.o transform_cuda.o
-	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
-
-runrm: 
-	$(EXEC) rm ../data/test*.tif
-
-runcpu: build
-	$(EXEC) ./test -t_srs WGS72 ../data/WGS84.tif ../data/testcpu.tif
-
-rungpu: build
-	$(EXEC) nvprof ./test -t_srs WGS72 -gpu ../data/WGS84.tif ../data/testgpu.tif
+run: build
+	$(EXEC) ./gdalsimplewarp -t_srs WGS72 ../../data/WGS84.tif test.tif
 	
 clean:
-	rm -f test main.o transform_cuda.o transofrm_cpu.o
+	rm -f gdalsimplewarp gdalsimplewarp.o
 
 clobber: clean
 
